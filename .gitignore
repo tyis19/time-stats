@@ -1,0 +1,23 @@
+# 打包产物（执行 node scripts/build.js 重新生成）
+/dist/
+
+# 开发用的 Electron 运行环境，348MB，执行 node scripts/extract-electron.js 重新解压
+/vendor/
+
+# 本机数据：软件清单、使用流水账、设置、图标缓存
+# 这些是个人使用记录，绝不入库
+/data/
+dist/**/data/
+dist/**/runtime/
+
+# 依赖与工具产物
+node_modules/
+*.log
+
+# 编辑器与系统杂项
+.workbuddy/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

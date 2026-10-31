@@ -1,0 +1,10 @@
+{
+  "name": "time-stats",
+  "productName": "时间统计",
+  "version": "1.0.0",
+  "description": "本地软件使用时间统计（Steam 风格）",
+  "main": "main/main.js",
+  "author": "gl",
+  "license": "MIT",
+  "private": true
+}
