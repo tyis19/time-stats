@@ -44,6 +44,13 @@ const Settings = {
               '<div><div class="t">自动备份</div><div class="d">每天第一次打开时备份一次数据，保留最近 7 天，放在 data\\backup 里。</div></div>' +
               '<span class="muted" style="font-size:11px">已开启</span>' +
             '</div>' +
+            '<div class="setting-row">' +
+              '<div><div class="t">诊断日志</div><div class="d">打开后，会把「每次判断这个软件在不在跑、为什么没算上」的过程写进 data\\debug.log。<br />平时不用开。某个软件总是记不上时，打开它、用一次该软件，再把日志拿出来就能看出卡在哪一步。</div></div>' +
+              '<div style="display:flex;align-items:center;gap:10px">' +
+                '<button class="btn ghost sm" id="btn-open-log">打开日志</button>' +
+                '<div class="switch' + (s.debugLog ? ' on' : '') + '" id="sw-debuglog"></div>' +
+              '</div>' +
+            '</div>' +
           '</div>' +
 
         '</div>' +
@@ -132,6 +139,19 @@ const Settings = {
     document.getElementById('btn-startup-folder').onclick = () => window.api.system.openStartupFolder();
     document.getElementById('btn-export').onclick = () => App.exportCsv();
 
+    document.getElementById('sw-debuglog').onclick = (e) =>
+      toggle(e.currentTarget, null, async (on) => {
+        const r = await window.api.settings.set({ debugLog: on });
+        App.state.settings.debugLog = r.settings.debugLog;
+        App.toast(on ? '诊断日志已打开，记录写到 data\\debug.log' : '诊断日志已关闭', 'ok');
+        return r;
+      });
+
+    document.getElementById('btn-open-log').onclick = async () => {
+      const r = await window.api.system.openLogFile();
+      if (!r.ok) App.toast(r.reason || '还没有日志文件', 'err');
+    };
+
     document.getElementById('btn-shortcut').onclick = async () => {
       const r = await window.api.system.createShortcut();
       if (r.ok) App.toast('桌面快捷方式已创建', 'ok');
@@ -147,6 +167,8 @@ const Settings = {
         ['进程数', d.processCount + ' 个，读取耗时 ' + d.scanMs + ' 毫秒'],
         ['轮询间隔', '计时中 ' + d.pollActiveMs / 1000 + ' 秒 / 待命 ' + d.pollWatchMs / 1000 + ' 秒'],
         ['自动监视', d.autoWatch ? '开' : '关'],
+        ['去抖门槛', (d.debounceMs || 0) / 1000 + ' 秒（自动监视时进程要活这么久才算数）'],
+        ['诊断日志', d.debugLog ? '已开启' : '关闭'],
         ['开机自启', d.autoLaunchEnabled ? '已启用' : '未启用'],
         ['启动项位置', d.autoLaunchFile],
         ['库里软件', d.appCount + ' 个'],

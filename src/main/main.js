@@ -21,6 +21,7 @@ const { initPaths } = require('./paths');
 const PATHS = initPaths();
 
 const { readJson, writeJson } = require('./services/store');
+const { logger } = require('./services/logger');
 const { AppRegistry } = require('./services/apps');
 const { SessionStore } = require('./services/sessions');
 const { Tracker } = require('./services/tracker');
@@ -32,16 +33,20 @@ const { createTray } = require('./tray');
 const { registerIpc } = require('./ipc');
 
 const DEFAULTS = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   autoWatch: false,
   pollActiveMs: 3000,
-  pollWatchMs: 5000,
+  pollWatchMs: 10000,
   graceTicks: 3,
   startTimeoutMs: 30000,
   launcherQuickExitMs: 60000,
-  handoverWindowMs: 120000,
-  heartbeatMs: 15000,
+  handoverWindowMs: 15000,
+  heartbeatMs: 5000,
   maxSessionMs: 86400000,
+  debounceMs: 5000,
+  stallMs: 20000,
+  stallBreakMs: 300000,
+  debugLog: false,
   closeToTray: true,
   autoLaunch: false,
   sort: 'lastUsed',
@@ -57,6 +62,24 @@ const saveSettings = () => {
     /* 忽略 */
   }
 };
+
+/**
+ * 老版本的 settings.json 会把「当时的默认值」原样写进文件，
+ * 所以光改 DEFAULTS 对已经装过的用户不生效。
+ * 这里只升级「还等于旧默认值」的字段——手改过的值不动。
+ *   待命轮询 5 秒 → 10 秒（省电，检测晚一点靠开始时间前推补回来）
+ *   交接窗口 2 分钟 → 15 秒
+ *   心跳 15 秒 → 5 秒（崩溃后少丢时间）
+ */
+if (!settings.schemaVersion || settings.schemaVersion < 2) {
+  if (settings.pollWatchMs === 5000) settings.pollWatchMs = 10000;
+  if (settings.handoverWindowMs === 120000) settings.handoverWindowMs = 15000;
+  if (settings.heartbeatMs === 15000) settings.heartbeatMs = 5000;
+  settings.schemaVersion = 2;
+  saveSettings();
+}
+
+logger.configure({ dir: PATHS.dataDir, enabled: settings.debugLog });
 
 const registry = new AppRegistry({ file: PATHS.appsFile, iconDir: PATHS.iconDir }).load();
 const sessions = new SessionStore(PATHS.sessionsFile).load();

@@ -174,11 +174,40 @@ const Detail = {
         '<td>' + (r.closedBy === 'recovered' ? '<span class="tag warn">异常中断</span>' : U.fmtTimeSec(r.endMs)) + '</td>' +
         '<td>' + U.fmtDuration(clean) + '</td>' +
         '<td>' + srcTag + ' ' + gap + '</td>' +
-        '<td><span class="table-link" data-del="' + r.id + '">删除</span></td>';
+        '<td><div class="row-actions">' +
+          '<span class="table-link" data-move="' + r.id + '">记错软件了</span>' +
+          '<span class="table-link" data-del="' + r.id + '">删除</span>' +
+        '</div></td>';
       tbody.appendChild(tr);
     }
 
     tbody.addEventListener('click', async (e) => {
+      const move = e.target.closest('[data-move]');
+      if (move) {
+        const selfId = this.data && this.data.app ? this.data.app.id : null;
+        const others = (App.state.apps || []).filter((a) => a.id !== selfId);
+        const picked = await App.pick(
+          '这条记录其实属于哪个软件？',
+          '时长、开始和结束时间都不会变，只是换个归属。',
+          others.map((a) => ({
+            key: a.id,
+            label: a.name,
+            sub: a.exePath ? String(a.exePath).split('\\').pop() : '',
+          }))
+        );
+        if (!picked) return;
+        const r = await window.api.stats.reassignSession({ id: move.dataset.move, appId: picked });
+        if (r.ok) {
+          const target = others.find((a) => a.id === picked);
+          App.toast('已改到「' + (target ? target.name : '另一个软件') + '」', 'ok');
+          Detail.reload();
+          App.refreshApps();
+        } else {
+          App.toast(r.reason || '改不了', 'err');
+        }
+        return;
+      }
+
       const del = e.target.closest('[data-del]');
       if (!del) return;
       const ok = await App.confirm('删除这条记录？', '这条记录会从统计里永久移除，其他记录不受影响。', '删除');

@@ -314,6 +314,48 @@ const App = {
     }
   },
 
+  /** 从一列选项里挑一个，返回选项的 key（取消返回 null） */
+  pick(title, text, items) {
+    return new Promise((resolve) => {
+      const wrap = document.getElementById('modal');
+      wrap.hidden = false;
+      wrap.innerHTML = '';
+      const box = U.el('div', 'modal wide');
+      box.innerHTML = '<h3>' + U.esc(title) + '</h3><p>' + text + '</p>';
+
+      const close = (val) => {
+        wrap.hidden = true;
+        wrap.innerHTML = '';
+        resolve(val);
+      };
+
+      const list = U.el('div', 'pick-list');
+      if (!items.length) {
+        list.innerHTML = '<div class="pick-empty">库里还没有别的软件</div>';
+      }
+      for (const it of items) {
+        const row = U.el('button', 'pick-row');
+        row.type = 'button';
+        row.appendChild(U.el('span', 'pick-name', it.label));
+        if (it.sub) row.appendChild(U.el('span', 'pick-sub', it.sub));
+        row.onclick = () => close(it.key);
+        list.appendChild(row);
+      }
+      box.appendChild(list);
+
+      const actions = U.el('div', 'modal-actions');
+      const cancel = U.el('button', 'btn ghost', '取消');
+      cancel.onclick = () => close(null);
+      actions.appendChild(cancel);
+      box.appendChild(actions);
+
+      wrap.appendChild(box);
+      wrap.onclick = (e) => {
+        if (e.target === wrap) close(null);
+      };
+    });
+  },
+
   toast(text, type) {
     const wrap = document.getElementById('toasts');
     if (!wrap) return;

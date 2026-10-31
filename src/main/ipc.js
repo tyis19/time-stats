@@ -6,6 +6,7 @@ const path = require('path');
 const { ipcMain, dialog, shell, app } = require('electron');
 const stats = require('./services/stats');
 const autolaunch = require('./services/autolaunch');
+const { logger } = require('./services/logger');
 
 function pad(n) {
   return String(n).padStart(2, '0');
@@ -225,6 +226,21 @@ function registerIpc(ctx) {
     return { ok };
   });
 
+  /** 「记错软件了」：把这条记录的归属换掉，时长和起止时间原样保留 */
+  ipcMain.handle('stats:reassign-session', (e, payload) => {
+    const p = payload || {};
+    if (!p.id || !p.appId) return { ok: false, reason: '参数不全' };
+    const target = registry.get(p.appId);
+    if (!target) return { ok: false, reason: '找不到这个软件' };
+    const ok = sessions.reassign(p.id, p.appId);
+    if (ok) {
+      logger.info('session', '一条记录改了归属', { id: p.id, 改成: target.name });
+      broadcast('apps:changed');
+      broadcast('tracker:update', tracker.snapshot());
+    }
+    return { ok };
+  });
+
   ipcMain.handle('stats:hours', (e, payload) => {
     const p = payload || {};
     const dayMs = p.dateMs || Date.now();
@@ -320,11 +336,14 @@ function registerIpc(ctx) {
   }));
 
   ipcMain.handle('settings:set', (e, patch) => {
-    const allowed = ['closeToTray', 'sort', 'sortDir', 'pollActiveMs', 'pollWatchMs', 'graceTicks'];
+    const allowed = ['closeToTray', 'sort', 'sortDir', 'pollActiveMs', 'pollWatchMs', 'graceTicks', 'debugLog'];
     for (const k of allowed) {
       if (patch && Object.prototype.hasOwnProperty.call(patch, k)) settings[k] = patch[k];
     }
     saveSettings();
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'debugLog')) {
+      logger.setEnabled(!!settings.debugLog);
+    }
     tracker.ensureTimer();
     return { ok: true, settings: Object.assign({}, settings) };
   });
@@ -343,6 +362,16 @@ function registerIpc(ctx) {
     return { ok: true };
   });
 
+  ipcMain.handle('system:open-log-file', () => {
+    const p = logger.path();
+    if (p && fs.existsSync(p)) {
+      shell.showItemInFolder(p);
+      return { ok: true, path: p };
+    }
+    shell.openPath(paths.dataDir);
+    return { ok: false, path: p || paths.dataDir, reason: '还没有日志文件，先打开数据文件夹' };
+  });
+
   ipcMain.handle('system:open-startup-folder', () => autolaunch.openStartupFolder());
 
   ipcMain.handle('system:diagnostics', async () => {
@@ -359,7 +388,11 @@ function registerIpc(ctx) {
       scanError: snap.error || null,
       pollActiveMs: settings.pollActiveMs,
       pollWatchMs: settings.pollWatchMs,
+      debounceMs: settings.debounceMs,
+      heartbeatMs: settings.heartbeatMs,
       autoWatch: settings.autoWatch,
+      debugLog: !!settings.debugLog,
+      logPath: logger.path(),
       sessionRows: sessions.all().length,
       badLines: sessions.badLines,
       appCount: registry.apps.length,

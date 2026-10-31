@@ -115,6 +115,19 @@ class SessionStore {
     this._rewrite();
   }
 
+  /**
+   * 把一条记录改归到另一个软件名下（「记错软件了」）。
+   * 起止时间、时长、休眠扣除全部原样保留，只换归属。
+   */
+  reassign(id, appId) {
+    const row = this.rows.find((r) => r.id === id);
+    if (!row) return false;
+    if (row.appId === appId) return true;
+    row.appId = appId;
+    this._rewrite();
+    return true;
+  }
+
   _rewrite() {
     ensureDir(path.dirname(this.file));
     const tmp = this.file + '.tmp';

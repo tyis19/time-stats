@@ -52,7 +52,9 @@ function normalizeName(name) {
 }
 
 function makeEmptySnap() {
-  return { byName: new Map(), byPid: new Set(), count: 0, at: Date.now(), error: null };
+  // byPid 是 Map<进程号, 归一化进程名>，不是 Set：
+  // 判活时要同时核对「号」和「名」，否则进程号被系统回收再分配时会认错人（凭空多记时长）。
+  return { byName: new Map(), byPid: new Map(), count: 0, at: Date.now(), error: null };
 }
 
 function parseTasklistBuffer(buf) {
@@ -81,8 +83,11 @@ function parseTasklistBuffer(buf) {
       const pid = parseInt(f[1], 10);
       if (!Number.isFinite(pid)) continue;
 
-      snap.byPid.add(pid);
       const key = normalizeName(f[0]);
+      // 首次解析出的非空名字优先；后一轮（另一种编码）解出乱码时不覆盖正确值
+      const prev = snap.byPid.get(pid);
+      if (prev === undefined || (!prev && key)) snap.byPid.set(pid, key);
+
       if (!key) continue;
       let set = snap.byName.get(key);
       if (!set) {
@@ -156,10 +161,31 @@ function hasPid(snap, pid) {
   return !!pid && snap.byPid.has(pid);
 }
 
+/**
+ * 进程号还在，而且是「同一个人」——同时核对号与名字。
+ * 只查号不查名的话，进程号被系统回收再分配给别的程序时会被误判成「还活着」，
+ * 计时停不下来，凭空多算几个小时。
+ */
+function pidMatches(snap, pid, name) {
+  if (!pid) return false;
+  const seen = snap.byPid.get(pid);
+  if (seen === undefined) return false;
+  if (!name) return true;
+  return seen === normalizeName(name);
+}
+
+/** 这个名字现在有几个实例在跑 */
+function countInstances(snap, name) {
+  const set = snap.byName.get(normalizeName(name));
+  return set ? set.size : 0;
+}
+
 module.exports = {
   scan,
   hasName,
   hasPid,
+  pidMatches,
+  countInstances,
   countByName,
   normalizeName,
   splitCsvLine,

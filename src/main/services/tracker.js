@@ -3,17 +3,27 @@
  * 计时核心：判断「还在不在跑」并维护一次会话的生死。
  *
  * 状态机：
- *   IDLE → STARTING → RUNNING → (HANDOVER) → IDLE
+ *   IDLE → STARTING → RUNNING → (HANDOVER) → IDLE     手动从本工具启动
+ *   IDLE → CANDIDATE → RUNNING → (HANDOVER) → IDLE    自动监视（先去抖观察一会儿）
  *   用户手动停表 → SUPPRESSED（进程不退就不再自动起表）
  *
- * 判活三级：进程号 → 主进程名 → 同目录候选进程名（启动器交接）
+ * 判活三级：进程号+进程名 → 主进程名 → 同目录候选进程名（启动器交接）
+ *
+ * 几个刻意的设计：
+ *   · 判活同时核对进程号和进程名。只核对号的话，进程号被系统回收再分配时会以为程序还开着。
+ *   · 自动监视要「活过 debounceMs」才真正建会话，一闪而过的启动器不会留下垃圾记录。
+ *   · 两次检查之间如果隔了很久（系统卡死），那段时间只扣掉、不算时长；隔太久才判中断结账。
+ *   · 同名进程有多个时，才去查真实路径区分——查路径要调 PowerShell，不能常做。
  */
 
 const { EventEmitter } = require('events');
 const scanMod = require('./process-scan');
+const procDetail = require('./process-detail');
+const { logger } = require('./logger');
 
 const STATE = {
   IDLE: 'IDLE',
+  CANDIDATE: 'CANDIDATE',
   STARTING: 'STARTING',
   RUNNING: 'RUNNING',
   HANDOVER: 'HANDOVER',
@@ -21,6 +31,8 @@ const STATE = {
 };
 
 const MIN_SESSION_SEC = 2; // 少于 2 秒的抖动不入库
+const DIR_PROBE_MS = 4000; // 同目录探测节流
+const VERIFY_MS = 30000; // 撞名校验节流
 
 class Tracker extends EventEmitter {
   constructor(deps) {
@@ -39,6 +51,8 @@ class Tracker extends EventEmitter {
     this.currentDelay = 0;
     this.ticking = false;
     this.lastHeartbeat = 0;
+    this.lastTickAt = 0;
+    this.lastSummaryAt = 0;
     this.suspendAt = 0;
     this.stats_ = { ticks: 0, lastScanMs: 0 };
   }
@@ -56,14 +70,46 @@ class Tracker extends EventEmitter {
         startedMs: null,
         lastSeenMs: null,
         launchedMs: null,
+        candidateSinceMs: 0,
         missed: 0,
         handoverUntil: 0,
         primaryGoneAt: 0,
         gapMs: 0,
+        dirCandidates: [],
+        dirProbedAt: 0,
+        dirProbing: false,
+        verifiedPids: null,
+        verifiedAt: 0,
+        verifyBusy: false,
       };
       this.runtimes.set(appId, r);
     }
     return r;
+  }
+
+  _resetRuntime(r) {
+    r.state = STATE.IDLE;
+    r.startedMs = null;
+    r.lastSeenMs = null;
+    r.launchedMs = null;
+    r.candidateSinceMs = 0;
+    r.pid = null;
+    r.missed = 0;
+    r.gapMs = 0;
+    r.source = null;
+    r.alts = [];
+    r.handoverUntil = 0;
+    r.primaryGoneAt = 0;
+    r.dirCandidates = [];
+    r.dirProbedAt = 0;
+    r.dirProbing = false;
+    r.verifiedPids = null;
+    r.verifiedAt = 0;
+  }
+
+  _appName(appId) {
+    const a = this.apps.get(appId);
+    return a ? a.name : appId;
   }
 
   isBusy(appId) {
@@ -75,7 +121,8 @@ class Tracker extends EventEmitter {
     const now = Date.now();
     const out = [];
     for (const r of this.runtimes.values()) {
-      if (r.state === STATE.IDLE) continue;
+      // CANDIDATE 还不算真正在计时（可能只是个一闪而过的启动器），不显示到界面上
+      if (r.state === STATE.IDLE || r.state === STATE.CANDIDATE) continue;
       const startedMs = r.startedMs || r.launchedMs || now;
       out.push({
         appId: r.appId,
@@ -95,7 +142,7 @@ class Tracker extends EventEmitter {
     const now = Date.now();
     const list = [];
     for (const r of this.runtimes.values()) {
-      if (r.state === STATE.IDLE) continue;
+      if (r.state === STATE.IDLE || r.state === STATE.CANDIDATE) continue;
       list.push({
         appId: r.appId,
         state: r.state,
@@ -132,6 +179,9 @@ class Tracker extends EventEmitter {
     r.pid = null;
     r.missed = 0;
     r.gapMs = 0;
+    r.candidateSinceMs = 0;
+    r.dirCandidates = [];
+    r.verifiedPids = null;
     r.primary = scanMod.normalizeName(app.imageName || app.name);
 
     // 候选进程：排除「启动前就已经在跑」的，避免把后台小工具当成本体
@@ -149,11 +199,18 @@ class Tracker extends EventEmitter {
       r.state = STATE.IDLE;
       r.source = null;
       r.pid = null;
+      logger.warn('start', '启动失败', { app: app.name, reason: result.reason });
       return { ok: false, reason: result.reason };
     }
 
     r.pid = result.pid || null;
     r.launchedMs = Date.now();
+    logger.info('start', '已启动并开始计时', {
+      app: app.name,
+      pid: r.pid,
+      主进程名: r.primary,
+      候选: r.alts.length,
+    });
     this.ensureTimer();
     this.emit('update');
     return { ok: true, pid: r.pid, mode: result.mode };
@@ -206,6 +263,12 @@ class Tracker extends EventEmitter {
     this.currentDelay = 0;
   }
 
+  /**
+   * 多久看一次进程表：
+   *   有人在计时 → 3 秒（要尽快发现它退出）
+   *   没人在计时、但开着自动监视 → 10 秒（省电，检测晚一点，靠把开始时间往前推补回来）
+   *   啥都没开 → 不看（完全不耗 CPU）
+   */
   _wantDelay(s) {
     let hasActive = false;
     let hasSuppressed = false;
@@ -213,8 +276,7 @@ class Tracker extends EventEmitter {
       if (r.state === STATE.SUPPRESSED) hasSuppressed = true;
       else if (r.state !== STATE.IDLE) hasActive = true;
     }
-    if (hasActive) return s.pollActiveMs;
-    if (hasSuppressed) return s.pollActiveMs; // 停表后仍要盯着进程何时退出
+    if (hasActive || hasSuppressed) return s.pollActiveMs;
     if (s.autoWatch) return s.pollWatchMs;
     return 0;
   }
@@ -226,6 +288,9 @@ class Tracker extends EventEmitter {
     try {
       const now = Date.now();
       const s = this.getSettings();
+
+      this._checkStall(now, s);
+
       const t0 = Date.now();
       const snap = await scanMod.scan({ force: true });
       this.stats_.ticks++;
@@ -234,6 +299,7 @@ class Tracker extends EventEmitter {
       for (const r of this.runtimes.values()) {
         if (r.state === STATE.IDLE) continue;
         this._advance(r, snap, now, s);
+        this._maybeVerify(r, snap);
       }
 
       if (s.autoWatch) this._autoWatch(snap, now, s);
@@ -244,11 +310,26 @@ class Tracker extends EventEmitter {
         this.persistActive();
       }
 
+      if (now - this.lastSummaryAt >= 30000) {
+        this.lastSummaryAt = now;
+        let active = 0;
+        for (const r of this.runtimes.values()) if (r.state !== STATE.IDLE) active++;
+        logger.debug('tick', '巡检完成', {
+          进程数: snap.count,
+          耗时ms: this.stats_.lastScanMs,
+          在跟踪: active,
+          自动监视: !!s.autoWatch,
+          间隔ms: this.currentDelay,
+        });
+      }
+
       this.emit('update');
     } catch (e) {
+      logger.warn('tick', '巡检出错', { error: e.message });
       this.emit('tracker-error', e);
     } finally {
       this.ticking = false;
+      this.lastTickAt = Date.now();
       const s = this.getSettings();
       const delay = this._wantDelay(s);
       if (delay) {
@@ -260,21 +341,160 @@ class Tracker extends EventEmitter {
     }
   }
 
+  /**
+   * 两次检查之间隔了太久（系统卡死、时钟跳变、被挂起）。
+   * 短时间：只把这几十秒扣掉，不虚增时长。
+   * 太久（超过 stallBreakMs）：判中断结账，用「最后一次看到它」当结束时间。
+   */
+  _checkStall(now, s) {
+    const prev = this.lastTickAt;
+    if (!prev) return;
+    const gap = now - prev;
+    if (gap <= (s.stallMs || 20000)) return;
+
+    let touched = 0;
+    let broke = 0;
+    for (const r of this.runtimes.values()) {
+      if (r.state === STATE.IDLE || r.state === STATE.SUPPRESSED) continue;
+      touched++;
+      if (gap > (s.stallBreakMs || 300000)) {
+        this._finish(r, r.lastSeenMs || prev, 'interrupted');
+        broke++;
+      } else {
+        r.gapMs += gap;
+      }
+    }
+    if (touched) {
+      logger.warn('tick', '两次检查间隔异常', { 间隔秒: Math.round(gap / 1000), 涉及会话: touched, 判中断: broke });
+      if (broke) this.persistActive();
+    }
+  }
+
+  /**
+   * 判活：进程号和进程名都要对得上。
+   * 撞名（同名进程不止一个）且已经查到过真实路径时，只在属于本软件目录的那些 pid 里认。
+   */
   _alive(r, snap) {
-    if (r.pid && snap.byPid.has(r.pid)) return 'pid';
-    if (r.primary && snap.byName.has(r.primary)) return 'name';
-    return null;
+    if (r.pid && scanMod.pidMatches(snap, r.pid, r.primary)) return 'pid';
+    if (!r.primary) return null;
+
+    const set = snap.byName.get(r.primary);
+    if (!set || !set.size) return null;
+
+    if (r.verifiedPids && r.verifiedPids.size) {
+      for (const pid of set) {
+        if (r.verifiedPids.has(pid)) return 'name';
+      }
+      return null; // 同名，但都不是这个软件的进程
+    }
+    return 'name';
   }
 
   _altAlive(r, snap) {
     for (const n of r.alts) {
       if (snap.byName.has(n)) return n;
     }
+    for (const n of r.dirCandidates) {
+      if (snap.byName.has(n)) return n;
+    }
     return null;
+  }
+
+  /**
+   * 同名进程有多个时才查真实路径（要调 PowerShell，约 1.5 秒），30 秒内不重复查。
+   * 平时单实例，一次都不会触发，零开销。
+   */
+  _maybeVerify(r, snap) {
+    if (!r.primary) return;
+    const set = snap.byName.get(r.primary);
+    if (!set || set.size <= 1) {
+      if (r.verifiedPids) r.verifiedPids = null;
+      return;
+    }
+    const now = Date.now();
+    if (r.verifyBusy || (r.verifiedAt && now - r.verifiedAt < VERIFY_MS)) return;
+
+    const app = this.apps.get(r.appId);
+    if (!app || !app.workDir) return;
+
+    r.verifyBusy = true;
+    logger.info('alive', '发现同名进程，按路径区分', {
+      app: app.name,
+      同名实例: set.size,
+    });
+
+    procDetail
+      .pathsFor([...set])
+      .then((map) => {
+        const base = String(app.workDir).toLowerCase().replace(/\\+$/, '');
+        const ok = new Set();
+        for (const [pid, p] of map) {
+          const low = String(p || '').toLowerCase();
+          if (low && low.startsWith(base + '\\')) ok.add(pid);
+        }
+        r.verifiedPids = ok.size ? ok : null;
+        r.verifiedAt = Date.now();
+        r.verifyBusy = false;
+        logger.debug('alive', '路径区分结果', { app: app.name, 属于本软件: ok.size, 同名总数: set.size });
+      })
+      .catch(() => {
+        r.verifyBusy = false;
+        r.verifiedAt = Date.now();
+      });
+  }
+
+  /** 启动器交接：查同一个安装目录下现在有哪些进程（异步，不阻塞巡检） */
+  _probeDir(r) {
+    const now = Date.now();
+    if (r.dirProbing) return;
+    if (r.dirProbedAt && now - r.dirProbedAt < DIR_PROBE_MS) return;
+    const app = this.apps.get(r.appId);
+    if (!app || !app.workDir) return;
+
+    r.dirProbedAt = now;
+    r.dirProbing = true;
+    procDetail
+      .namesInDir(app.workDir, r.primary)
+      .then((names) => {
+        r.dirCandidates = names;
+        r.dirProbing = false;
+        if (names.length) logger.debug('handover', '同目录候选进程', { app: app.name, 名单: names });
+      })
+      .catch(() => {
+        r.dirProbing = false;
+      });
   }
 
   _advance(r, snap, now, s) {
     switch (r.state) {
+      /* 自动监视新发现的进程：先观察，活过 debounceMs 才算数 */
+      case STATE.CANDIDATE: {
+        if (this._alive(r, snap)) {
+          r.lastSeenMs = now;
+          const waited = now - (r.candidateSinceMs || now);
+          if (waited >= (s.debounceMs || 5000)) {
+            r.state = STATE.RUNNING;
+            r.startedMs = r.candidateSinceMs || now; // 从第一次看到算起，不丢这几秒
+            r.missed = 0;
+            this.persistActive();
+            logger.info('session', '观察期满，开始计时', {
+              app: this._appName(r.appId),
+              等待秒: Math.round(waited / 1000),
+            });
+            this.emit('session-started', { appId: r.appId, startMs: r.startedMs, source: r.source });
+          }
+          return;
+        }
+        // 观察期内就没了 → 一闪而过，不留记录
+        logger.info('watch', '进程一闪而过，未计入', {
+          app: this._appName(r.appId),
+          存活秒: Math.round((now - (r.candidateSinceMs || now)) / 1000),
+        });
+        this._resetRuntime(r);
+        this.persistActive();
+        return;
+      }
+
       case STATE.STARTING: {
         if (this._alive(r, snap)) {
           r.state = STATE.RUNNING;
@@ -289,6 +509,7 @@ class Tracker extends EventEmitter {
           r.state = STATE.IDLE;
           r.source = null;
           r.pid = null;
+          logger.warn('start', '启动后一直没看到进程', { app: this._appName(r.appId) });
           this.emit('launch-failed', { appId: r.appId });
           this.persistActive();
         }
@@ -306,11 +527,23 @@ class Tracker extends EventEmitter {
         // 刚启动没几秒主进程就没了 → 典型「启动器交出控制权」，等本体出现
         const livedMs = (r.lastSeenMs || now) - (r.startedMs || now);
         const looksLikeLauncher = livedMs < s.launcherQuickExitMs;
+        const app = this.apps.get(r.appId);
+        const hasCandidates = r.alts.length > 0 || (app && app.altNames && app.altNames.length > 0);
 
-        if (r.missed === 1 && r.alts.length && looksLikeLauncher) {
+        if (r.missed === 1 && looksLikeLauncher && hasCandidates) {
+          // 兜底：自动监视建立的会话可能还没带候选名单，这里补上
+          if (!r.alts.length && app && Array.isArray(app.altNames)) {
+            r.alts = app.altNames.map(scanMod.normalizeName).filter((n) => n && n !== r.primary);
+          }
           r.state = STATE.HANDOVER;
           r.primaryGoneAt = r.lastSeenMs || now;
-          r.handoverUntil = now + s.handoverWindowMs;
+          r.handoverUntil = now + (s.handoverWindowMs || 15000);
+          logger.info('handover', '主进程提前退出，等本体出现', {
+            app: this._appName(r.appId),
+            存活秒: Math.round(livedMs / 1000),
+            窗口秒: Math.round((s.handoverWindowMs || 15000) / 1000),
+          });
+          this._probeDir(r); // 异步补充「同目录现在真的有哪些进程」
           this.emit('handover', { appId: r.appId });
           return;
         }
@@ -326,15 +559,26 @@ class Tracker extends EventEmitter {
         if (alt) {
           r.primary = alt;
           r.alts = [];
+          r.dirCandidates = [];
+          r.verifiedPids = null;
           r.state = STATE.RUNNING;
           r.missed = 0;
           r.lastSeenMs = now;
+          logger.info('handover', '交接成功，改盯本体进程', {
+            app: this._appName(r.appId),
+            新进程: alt,
+          });
           this.emit('handover-done', { appId: r.appId, process: alt });
           return;
         }
         if (now > r.handoverUntil) {
+          logger.info('handover', '交接窗口内没等到本体，按启动器退出结账', {
+            app: this._appName(r.appId),
+          });
           this._finish(r, (r.primaryGoneAt || now) + Math.round(s.pollActiveMs / 2), 'launcher-exit');
+          return;
         }
+        this._probeDir(r); // 还没等到，继续隔几秒查一次同目录
         return;
       }
 
@@ -344,6 +588,7 @@ class Tracker extends EventEmitter {
           r.source = null;
           this.suppressed.delete(r.appId);
           this.persistActive();
+          logger.debug('suppress', '进程已退出，解除停表压制', { app: this._appName(r.appId) });
         }
         return;
       }
@@ -363,17 +608,27 @@ class Tracker extends EventEmitter {
       const prev = this.autoPrev.has(app.id) ? this.autoPrev.get(app.id) : cur;
 
       if (r.state === STATE.IDLE && !this.suppressed.has(app.id) && prev === 0 && cur > 0) {
-        r.state = STATE.RUNNING;
+        // 不立刻建会话：先进候选态，活够 debounceMs 才算数
+        r.state = STATE.CANDIDATE;
         r.source = 'autowatch';
-        r.startedMs = now - Math.round(s.pollActiveMs / 2);
-        r.lastSeenMs = now;
         r.primary = key;
-        r.alts = [];
+        r.candidateSinceMs = now;
+        r.lastSeenMs = now;
         r.pid = null;
+        // 同目录的候选进程先备着，万一这个是启动器，交接时立刻用得上
+        r.alts = (app.altNames || [])
+          .map(scanMod.normalizeName)
+          .filter((n) => n && n !== key);
         r.missed = 0;
         r.gapMs = 0;
-        this.persistActive();
-        this.emit('session-started', { appId: app.id, startMs: r.startedMs, source: 'autowatch' });
+        r.dirCandidates = [];
+        r.verifiedPids = null;
+        logger.info('watch', '发现新进程，开始观察', {
+          app: app.name,
+          进程名: key,
+          实例数: cur,
+          门槛秒: Math.round((s.debounceMs || 5000) / 1000),
+        });
       }
       this.autoPrev.set(app.id, cur);
     }
@@ -389,6 +644,7 @@ class Tracker extends EventEmitter {
         const set = snap.byName.get(key);
         this.autoPrev.set(app.id, set ? set.size : 0);
       }
+      logger.info('watch', '重置基线（此刻已经在跑的软件不会被计入）');
       this.ensureTimer();
       this.emit('update');
     } catch (e) {
@@ -417,19 +673,18 @@ class Tracker extends EventEmitter {
         image: r.primary || '',
         recovered: !!options.recovered,
       });
+      logger.info('session', '记录一次使用', {
+        app: this._appName(r.appId),
+        时长秒: sec,
+        扣除秒: Math.round(r.gapMs / 1000),
+        结束原因: reason,
+        来源: r.source,
+      });
+    } else if (sec > 0) {
+      logger.info('session', '太短，不入库', { app: this._appName(r.appId), 时长秒: sec, 结束原因: reason });
     }
 
-    r.state = STATE.IDLE;
-    r.startedMs = null;
-    r.lastSeenMs = null;
-    r.launchedMs = null;
-    r.pid = null;
-    r.missed = 0;
-    r.gapMs = 0;
-    r.source = null;
-    r.alts = [];
-    r.handoverUntil = 0;
-
+    this._resetRuntime(r);
     this.persistActive();
     if (row) this.emit('session-ended', row);
     return row;
@@ -466,7 +721,9 @@ class Tracker extends EventEmitter {
         r.primary = a.primary || scanMod.normalizeName(app.imageName || app.name);
         r.missed = 0;
         resumed++;
+        logger.info('recover', '上次没关掉的会话，继续计时', { app: app.name });
       } else {
+        // 用「最后一次心跳」当结束时间，宁可少算几秒，绝不多算
         const r = {
           appId: a.appId,
           state: STATE.RUNNING,
@@ -481,6 +738,7 @@ class Tracker extends EventEmitter {
         };
         this._finish(r, Math.min(a.lastSeenMs || now, now), 'recovered', { recovered: true });
         closed++;
+        logger.info('recover', '上次遗留的会话按最后心跳结账', { app: app.name });
       }
     }
 
@@ -493,6 +751,7 @@ class Tracker extends EventEmitter {
   onSuspend() {
     this.suspendAt = Date.now();
     this.stopTimer();
+    logger.info('power', '系统进入睡眠，暂停巡检');
   }
 
   onResume() {
@@ -505,6 +764,8 @@ class Tracker extends EventEmitter {
       }
       this.persistActive();
     }
+    this.lastTickAt = Date.now(); // 别把睡着的这段时间当成「系统卡死」
+    logger.info('power', '系统唤醒，恢复巡检', { 睡眠秒: Math.round(gap / 1000) });
     this.ensureTimer();
     this.emit('update');
   }
