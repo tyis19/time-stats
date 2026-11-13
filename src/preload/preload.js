@@ -19,6 +19,15 @@ contextBridge.exposeInMainWorld('api', {
   watch: {
     set: (enabled) => invoke('watch:set', { enabled }),
   },
+  tags: {
+    list: () => invoke('tags:list'),
+    create: (payload) => invoke('tags:create', payload),
+    update: (payload) => invoke('tags:update', payload),
+    reorder: (ids) => invoke('tags:reorder', { ids }),
+    remove: (payload) => invoke('tags:delete', payload),
+    setApps: (payload) => invoke('tags:set-apps', payload),
+    setAppTags: (payload) => invoke('apps:set-tags', payload),
+  },
   tracker: {
     snapshot: () => invoke('tracker:snapshot'),
   },
@@ -31,6 +40,7 @@ contextBridge.exposeInMainWorld('api', {
     hours: (payload) => invoke('stats:hours', payload),
     calendar: (payload) => invoke('stats:calendar', payload),
     ranking: (payload) => invoke('stats:ranking', payload),
+    tags: (payload) => invoke('stats:tags', payload),
     appDetail: (id) => invoke('stats:app-detail', id),
     exportCsv: () => invoke('stats:export-csv'),
   },
@@ -61,5 +71,8 @@ contextBridge.exposeInMainWorld('api', {
   },
   onAppsChanged: (cb) => {
     ipcRenderer.on('apps:changed', () => cb());
+  },
+  onTagsChanged: (cb) => {
+    ipcRenderer.on('tags:changed', () => cb());
   },
 });

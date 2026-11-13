@@ -6,6 +6,7 @@ const path = require('path');
 const { ipcMain, dialog, shell, app } = require('electron');
 const stats = require('./services/stats');
 const autolaunch = require('./services/autolaunch');
+const { normalizeTagIds, applyTagMembers, stripTagFromApps } = require('./services/tags');
 const { logger } = require('./services/logger');
 
 function pad(n) {
@@ -33,9 +34,30 @@ function fmtHms(sec) {
 }
 
 function registerIpc(ctx) {
-  const { getWin, settings, saveSettings, registry, sessions, tracker, paths, broadcast } = ctx;
+  const { getWin, settings, saveSettings, registry, tags, sessions, tracker, paths, broadcast } = ctx;
 
-  const appMap = () => new Map(registry.apps.map((a) => [a.id, a]));
+  /**
+   * 软件编号 → 软件。
+   * 顺带把「查不到对应标签」的孤儿编号过滤掉（比如 tags.json 被误删过），
+   * 这样界面和统计都不会被不存在的标签带偏；软件里的原始编号不动，找回 tags.json 就恢复。
+   */
+  const appMap = () => {
+    const known = new Set(tags.list().map((t) => t.id));
+    const map = new Map();
+    for (const a of registry.apps) {
+      map.set(a.id, Object.assign({}, a, { tagIds: (a.tagIds || []).filter((id) => known.has(id)) }));
+    }
+    return map;
+  };
+
+  const pickedTags = (p) => (Array.isArray(p && p.tagIds) ? p.tagIds.filter((x) => typeof x === 'string') : []);
+
+  const filterRows = (rows, map, selected) => {
+    if (!selected.length) return rows;
+    return rows.filter((r) => stats.matchesTags(map.get(r.appId), selected));
+  };
+
+  const broadcastTags = () => broadcast('tags:changed');
 
   /* ------------------------------- 软件库 ------------------------------- */
 
@@ -150,6 +172,100 @@ function registerIpc(ctx) {
     return { ok: true };
   });
 
+  /* ------------------------------- 标签 ------------------------------- */
+
+  /** 标签清单 + 每个标签挂着几个软件、总共多少时长（管理窗口用） */
+  ipcMain.handle('tags:list', () => {
+    const map = appMap();
+    const secById = new Map();
+
+    for (const s of sessions.all()) {
+      const v = stats.effSecInRange(s, 0, Number.MAX_SAFE_INTEGER);
+      if (v <= 0) continue;
+      const ids = (map.get(s.appId) || {}).tagIds || [];
+      for (const id of ids) secById.set(id, (secById.get(id) || 0) + v);
+    }
+
+    const appCountById = new Map();
+    let untaggedApps = 0;
+    for (const a of registry.list()) {
+      const ids = (map.get(a.id) || {}).tagIds || [];
+      if (!ids.length) untaggedApps++;
+      for (const id of ids) appCountById.set(id, (appCountById.get(id) || 0) + 1);
+    }
+
+    return {
+      tags: tags.list().map((t) => ({
+        id: t.id,
+        name: t.name,
+        color: t.color,
+        appCount: appCountById.get(t.id) || 0,
+        sec: Math.round(secById.get(t.id) || 0),
+      })),
+      untagged: { appCount: untaggedApps },
+    };
+  });
+
+  ipcMain.handle('tags:create', (e, payload) => {
+    const p = payload || {};
+    const r = tags.create(p.name, p.color);
+    if (r.ok) broadcastTags();
+    return r;
+  });
+
+  ipcMain.handle('tags:update', (e, payload) => {
+    const p = payload || {};
+    const r = tags.update(p.id, p.patch || {});
+    if (r.ok) {
+      broadcastTags();
+      broadcast('apps:changed'); // 改了名字，卡片上的小标签要跟着重画
+    }
+    return r;
+  });
+
+  ipcMain.handle('tags:reorder', (e, payload) => {
+    const r = tags.reorder(payload && payload.ids);
+    if (r.ok) broadcastTags();
+    return r;
+  });
+
+  /** 删标签：可以把用它的软件转到另一个标签（等于合并），也可以丢回「未分类」 */
+  ipcMain.handle('tags:delete', (e, payload) => {
+    const p = payload || {};
+    if (!tags.get(p.id)) return { ok: false, reason: '找不到这个标签' };
+    const moveTo = p.moveTo && p.moveTo !== p.id && tags.get(p.moveTo) ? p.moveTo : null;
+    const changed = stripTagFromApps(registry.apps, p.id, moveTo);
+    if (changed) registry.save();
+    tags.remove(p.id);
+    broadcastTags();
+    broadcast('apps:changed');
+    return { ok: true, moved: changed, moveTo };
+  });
+
+  /** 一次把这个标签的成员设成 appIds（「勾选属于这个标签的软件」） */
+  ipcMain.handle('tags:set-apps', (e, payload) => {
+    const p = payload || {};
+    if (!tags.get(p.tagId)) return { ok: false, reason: '找不到这个标签' };
+    const changed = applyTagMembers(registry.apps, p.tagId, p.appIds || []);
+    if (changed) registry.save();
+    broadcastTags();
+    broadcast('apps:changed');
+    return { ok: true, changed };
+  });
+
+  /** 一个软件的标签整体换成 tagIds（卡片右键 / 详情页用） */
+  ipcMain.handle('apps:set-tags', (e, payload) => {
+    const p = payload || {};
+    const known = new Set(tags.list().map((t) => t.id));
+    const ids = normalizeTagIds(p.tagIds).filter((id) => known.has(id));
+    const r = registry.update(p.appId, { tagIds: ids });
+    if (r.ok) {
+      broadcastTags();
+      broadcast('apps:changed');
+    }
+    return r;
+  });
+
   /* ------------------------------- 监视开关 ------------------------------- */
 
   ipcMain.handle('watch:set', async (e, payload) => {
@@ -164,11 +280,13 @@ function registerIpc(ctx) {
 
   /* ------------------------------- 统计 ------------------------------- */
 
-  ipcMain.handle('stats:overview', () => {
+  ipcMain.handle('stats:overview', (e, payload) => {
+    const p = payload || {};
     const now = Date.now();
     const dayStart = stats.startOfDay(now);
     const dayEnd = stats.addDays(dayStart, 1);
-    const rows = sessions.all();
+    const map = appMap();
+    const rows = filterRows(sessions.all(), map, pickedTags(p));
 
     const today = stats.overview(rows, dayStart, dayEnd);
     const week = stats.overview(rows, stats.startOfWeek(now), dayEnd);
@@ -176,7 +294,7 @@ function registerIpc(ctx) {
     let totalSec = 0;
     for (const s of rows) totalSec += stats.effSecInRange(s, 0, Number.MAX_SAFE_INTEGER);
 
-    const rank = stats.ranking(rows, appMap(), dayStart, dayEnd);
+    const rank = stats.ranking(rows, map, dayStart, dayEnd);
     const st = stats.streak(rows);
 
     return {
@@ -198,12 +316,14 @@ function registerIpc(ctx) {
     const days = Math.max(1, p.days || 30);
     const from = stats.addDays(stats.startOfDay(now), -(days - 1));
     const to = stats.addDays(stats.startOfDay(now), 1);
-    return stats.daySeries(sessions.all(), from, to, p.appId || null);
+    const rows = filterRows(sessions.all(), appMap(), pickedTags(p));
+    return stats.daySeries(rows, from, to, p.appId || null);
   });
 
   ipcMain.handle('stats:sessions', (e, payload) => {
     const p = payload || {};
     let rows = p.appId ? sessions.forApp(p.appId) : sessions.all();
+    if (!p.appId) rows = filterRows(rows, appMap(), pickedTags(p));
     rows = rows.slice().sort((a, b) => b.startMs - a.startMs);
     const total = rows.length;
     const offset = Math.max(0, p.offset || 0);
@@ -244,7 +364,8 @@ function registerIpc(ctx) {
   ipcMain.handle('stats:hours', (e, payload) => {
     const p = payload || {};
     const dayMs = p.dateMs || Date.now();
-    return stats.hourly(sessions.all(), dayMs, p.appId || null);
+    const rows = filterRows(sessions.all(), appMap(), pickedTags(p));
+    return stats.hourly(rows, dayMs, p.appId || null);
   });
 
   ipcMain.handle('stats:calendar', (e, payload) => {
@@ -253,7 +374,8 @@ function registerIpc(ctx) {
     const days = Math.max(7, p.days || 91);
     const from = stats.addDays(stats.startOfDay(now), -(days - 1));
     const to = stats.addDays(stats.startOfDay(now), 1);
-    return stats.calendar(sessions.all(), from, to, p.appId || null);
+    const rows = filterRows(sessions.all(), appMap(), pickedTags(p));
+    return stats.calendar(rows, from, to, p.appId || null);
   });
 
   ipcMain.handle('stats:ranking', (e, payload) => {
@@ -265,7 +387,77 @@ function registerIpc(ctx) {
     if (p.range === 'week') from = stats.startOfWeek(now);
     else if (p.range === 'month') from = stats.startOfMonth(now);
     else if (p.range === 'all') from = 0;
-    return stats.ranking(sessions.all(), appMap(), from, dayEnd);
+    const map = appMap();
+    const rows = filterRows(sessions.all(), map, pickedTags(p));
+    return stats.ranking(rows, map, from, dayEnd);
+  });
+
+  /**
+   * 按标签统计。
+   * 分母 denom = 图里各片时长 + 未分类时长；多标签会让 denom 大于真实总时长，
+   * 差额放在 overlapSec 里，界面用小字如实说明，不假装能加得起来。
+   *
+   * 选中两个以上标签时（scoped），环里只算选中的那几个标签。
+   * 筛选是「或」：命中的软件身上往往还挂着「游戏」这类大类标签，
+   * 把它画进去会白占一大片，还会把真正的占比压小。用户比的是所选几类，就只画这几类。
+   */
+  ipcMain.handle('stats:tags', (e, payload) => {
+    const p = payload || {};
+    const now = Date.now();
+    const dayStart = stats.startOfDay(now);
+    const dayEnd = stats.addDays(dayStart, 1);
+    let from = 0;
+    if (p.range === 'today') from = dayStart;
+    else if (p.range === 'week') from = stats.startOfWeek(now);
+    else if (p.range === 'month') from = stats.startOfMonth(now);
+
+    const map = appMap();
+    const picked = pickedTags(p);
+    const rows = filterRows(sessions.all(), map, picked);
+
+    const scopedIds = picked.filter((id) => id !== '__none__');
+    const scoped = picked.length >= 2 && scopedIds.length > 0;
+    const scopedSet = scoped ? new Set(scopedIds) : null;
+
+    const b = stats.tagBreakdown(rows, map, from, dayEnd, scopedSet);
+
+    const appCount = new Map();
+    for (const a of registry.list()) {
+      const ids = (map.get(a.id) || {}).tagIds || [];
+      for (const id of ids) appCount.set(id, (appCount.get(id) || 0) + 1);
+    }
+
+    const list = [];
+    let taggedSec = 0;
+    for (const t of tags.list()) {
+      if (scopedSet && !scopedSet.has(t.id)) continue;
+      const rec = b.perTag.get(t.id);
+      if (!rec) continue;
+      const sec = Math.round(rec.sec);
+      taggedSec += sec;
+      list.push({
+        id: t.id,
+        name: t.name,
+        color: t.color,
+        sec,
+        sessionCount: rec.sessionCount,
+        appCount: appCount.get(t.id) || rec.appIds.size,
+      });
+    }
+    list.sort((a, b2) => b2.sec - a.sec);
+
+    const denom = taggedSec + b.untaggedSec;
+    return {
+      range: p.range || 'all',
+      totalSec: b.totalSec,
+      taggedSec,
+      denom,
+      overlapSec: Math.max(0, denom - b.totalSec),
+      untagged: { sec: b.untaggedSec, sessionCount: b.untaggedSessions },
+      filtered: picked.length > 0,
+      scoped,
+      tags: list,
+    };
   });
 
   ipcMain.handle('stats:app-detail', (e, id) => {
@@ -302,13 +494,18 @@ function registerIpc(ctx) {
     if (res.canceled || !res.filePath) return { ok: false, canceled: true };
 
     const rows = sessions.all().slice().sort((a, b) => a.startMs - b.startMs);
-    const lines = ['软件,开始时间,结束时间,时长,时长(秒),日期,来源,结束原因,含休眠(秒)'];
+    const tagName = (id) => {
+      const t = tags.get(id);
+      return t ? t.name : '';
+    };
+    const lines = ['软件,标签,开始时间,结束时间,时长,时长(秒),日期,来源,结束原因,含休眠(秒)'];
     for (const r of rows) {
       const a = registry.get(r.appId);
       const clean = Math.max(0, Math.round((r.endMs - r.startMs - (r.gapMs || 0)) / 1000));
       lines.push(
         [
           a ? a.name : '（已移除）',
+          a ? (a.tagIds || []).map(tagName).filter(Boolean).join('、') : '',
           humanTime(r.startMs),
           humanTime(r.endMs),
           fmtHms(clean),

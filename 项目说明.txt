@@ -40,19 +40,22 @@
 　　logger.js　　　　　　　　　 诊断日志（写 data\debug.log，2MB 轮转留 3 份）
 　　launcher.js　　　　　　　　 启动程序 / 强制关闭
 　　sessions.js　　　　　　　　 流水账（一行一次使用）
-　　stats.js　　　　　　　　　　统计口径（跨天拆分、休眠扣除）
+　　stats.js　　　　　　　　　　统计口径（跨天拆分、休眠扣除、按标签汇总）
 　　apps.js　　　　　　　　　　 软件库、读 exe 名字和图标
+　　tags.js　　　　　　　　　　 标签库（存编号不存名字；删标签时从软件上摘干净）
 　　icon-extract.js　　　　　　 图标提取（256px → 32px → 首字母）
 　　autolaunch.js　　　　　　　 开机自启（启动文件夹快捷方式）
 　　ps\proc-detail.ps1　　　　　被 process-detail.js 调用，输出 pid/名字/路径
 　src\renderer\　　　　　　　　 界面（原生 HTML/CSS/JS，没有框架）
 　　js\library.js 库　　js\detail.js 详情　　js\stats.js 统计
 　　js\settings.js 设置　js\charts.js 图表　js\app.js 总控
+　　js\tags.js 标签（筛选条、管理窗口、分配窗口）
 
 
 五、自带的自检脚本
 　node scripts\probe.js　　　　　　 检查进程扫描是否正常
 　node scripts\test-stats.js　　　　检查跨天拆分等统计算法
+　node scripts\test-tags.js　　　　 检查标签增删改、旧数据兼容、多标签统计口径
 　node scripts\test-tracker-logic.js　检查去抖、交接、防进程号复用、中断扣除
 　　　　　　　　　　　　　　　　　　（用假进程表跑，不用启动任何真实程序）
 　（还有几个 GUI 测试，需要 vendor 里的运行环境，不常用）
@@ -73,3 +76,12 @@
 　· 查进程真实路径要调 PowerShell（约 1.5 秒），
 　　只能低频或按需，不能塞进每一轮巡检
 　　（这里以前出过 bug：开机自启后不监视）
+　· 标签只挂在软件上，sessions.ndjson 里不存标签
+　　（存编号不存名字：改名立刻生效，不用重算历史；没标签的软件算「未分类」）
+　· 删标签必须调 stripTagFromApps 把软件上的编号一起摘掉，
+　　否则界面会指向一个查不到的标签
+　· 多标签统计会重复计（overlapSec），界面要如实显示重叠量，
+　　别偷偷去重假装能加得起来
+　· 改名（customName）只动 app.name，系统原名备份在 app.autoName。
+　　tracker 认进程靠 imageName，不是 name；改名时若 imageName 为空会从
+　　exePath 反推补上，别把这条兜底删了，否则改了中文名就记不到时长

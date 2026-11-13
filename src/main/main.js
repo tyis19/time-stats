@@ -23,6 +23,7 @@ const PATHS = initPaths();
 const { readJson, writeJson } = require('./services/store');
 const { logger } = require('./services/logger');
 const { AppRegistry } = require('./services/apps');
+const { TagStore } = require('./services/tags');
 const { SessionStore } = require('./services/sessions');
 const { Tracker } = require('./services/tracker');
 const stats = require('./services/stats');
@@ -82,6 +83,7 @@ if (!settings.schemaVersion || settings.schemaVersion < 2) {
 logger.configure({ dir: PATHS.dataDir, enabled: settings.debugLog });
 
 const registry = new AppRegistry({ file: PATHS.appsFile, iconDir: PATHS.iconDir }).load();
+const tags = new TagStore({ file: PATHS.tagsFile }).load();
 const sessions = new SessionStore(PATHS.sessionsFile).load();
 
 let mainWindow = null;
@@ -144,7 +146,7 @@ function dailyBackup() {
     const dir = path.join(PATHS.backupDir, day);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
-      for (const f of [PATHS.appsFile, PATHS.sessionsFile, PATHS.settingsFile]) {
+      for (const f of [PATHS.appsFile, PATHS.tagsFile, PATHS.sessionsFile, PATHS.settingsFile]) {
         if (fs.existsSync(f)) fs.copyFileSync(f, path.join(dir, path.basename(f)));
       }
       const dirs = fs
@@ -208,6 +210,7 @@ app.whenReady().then(async () => {
     settings,
     saveSettings,
     registry,
+    tags,
     sessions,
     tracker,
     paths: PATHS,
@@ -294,8 +297,23 @@ app.whenReady().then(async () => {
     setTimeout(async () => {
       try {
         const view = shotArg.includes('=') ? shotArg.split('=')[1] : 'library';
+
+        // 调试用：--filter=t2,t3 先把标签筛选打开，再截图
+        const filterArg = process.argv.find((a) => a.startsWith('--filter='));
+        if (filterArg) {
+          const ids = filterArg.split('=')[1].split(',').filter(Boolean);
+          await mainWindow.webContents.executeJavaScript(
+            'App.state.tagFilter = new Set(' + JSON.stringify(ids) + ');' +
+            'if (App.state.view === "library") Library.render();'
+          );
+        }
+
         if (view === 'detail') {
           await mainWindow.webContents.executeJavaScript('Detail.open(App.state.apps[0].id)');
+        } else if (view === 'tags') {
+          await mainWindow.webContents.executeJavaScript('Tags.manager()');
+        } else if (view === 'assign') {
+          await mainWindow.webContents.executeJavaScript('Tags.assign(App.state.apps[0].id)');
         } else if (view !== 'library') {
           await mainWindow.webContents.executeJavaScript('App.setView(' + JSON.stringify(view) + ')');
         }

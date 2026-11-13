@@ -67,6 +67,78 @@ const Charts = {
     container.appendChild(legend);
   },
 
+  /**
+   * 环形占比图：items = [{name, sec, color}]
+   * 环的分母是「传进来的这些项之和」，所以永远是一整圈；
+   * 多标签造成的重复在数据层就算好 overlap，这里不掺和。
+   */
+  donut(container, items) {
+    container.innerHTML = '';
+    const total = items.reduce((sum, it) => sum + (it.sec || 0), 0);
+    if (!total) {
+      container.appendChild(U.el('div', 'loading', '这段时间还没有记录'));
+      return;
+    }
+
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 140 140');
+    svg.setAttribute('class', 'donut'); // SVG 元素的 className 是只读的，只能这么写
+
+    const ring = document.createElementNS(NS, 'circle');
+    ring.setAttribute('cx', '70');
+    ring.setAttribute('cy', '70');
+    ring.setAttribute('r', '54');
+    ring.setAttribute('fill', 'none');
+    ring.setAttribute('stroke', 'rgba(255,255,255,0.05)');
+    ring.setAttribute('stroke-width', '16');
+    svg.appendChild(ring);
+
+    const C = 2 * Math.PI * 54;
+    let offset = 0;
+    for (const it of items) {
+      const share = (it.sec || 0) / total;
+      const len = Math.max(0, share * C - 1.5); // 留 1.5 的缝，块与块才分得开
+      const arc = document.createElementNS(NS, 'circle');
+      arc.setAttribute('cx', '70');
+      arc.setAttribute('cy', '70');
+      arc.setAttribute('r', '54');
+      arc.setAttribute('fill', 'none');
+      arc.setAttribute('stroke', it.color);
+      arc.setAttribute('stroke-width', '16');
+      arc.setAttribute('stroke-dasharray', len + ' ' + (C - len));
+      arc.setAttribute('stroke-dashoffset', String(-offset));
+      arc.setAttribute('transform', 'rotate(-90 70 70)');
+      const tip = document.createElementNS(NS, 'title');
+      tip.textContent = it.name + ' · ' + U.fmtDuration(it.sec) + ' · ' + Math.round(share * 100) + '%';
+      arc.appendChild(tip);
+      svg.appendChild(arc);
+      offset += share * C;
+    }
+
+    const top = items.slice().sort((a, b) => b.sec - a.sec)[0];
+    const pct = document.createElementNS(NS, 'text');
+    pct.setAttribute('x', '70');
+    pct.setAttribute('y', '67');
+    pct.setAttribute('text-anchor', 'middle');
+    pct.setAttribute('fill', '#e6eef5');
+    pct.setAttribute('font-size', '20');
+    pct.setAttribute('font-weight', '600');
+    pct.textContent = Math.round((top.sec / total) * 100) + '%';
+    svg.appendChild(pct);
+
+    const name = document.createElementNS(NS, 'text');
+    name.setAttribute('x', '70');
+    name.setAttribute('y', '86');
+    name.setAttribute('text-anchor', 'middle');
+    name.setAttribute('fill', '#8ba0b2');
+    name.setAttribute('font-size', '11');
+    name.textContent = top.name.length > 6 ? top.name.slice(0, 6) + '…' : top.name;
+    svg.appendChild(name);
+
+    container.appendChild(svg);
+  },
+
   /** 排行榜：rows = [{name, iconFile, sec, count}] */
   ranking(container, rows) {
     container.innerHTML = '';

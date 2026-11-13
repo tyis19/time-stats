@@ -42,6 +42,11 @@ const Detail = {
       today: x.date === U.fmtDate(Date.now()),
     }));
 
+    const appTags = Tags.ofApp(app);
+    const tagPills = appTags.length
+      ? appTags.map((t) => Tags.pillHtml(t, 'lg')).join('')
+      : '<span class="tag-pill none">未分类</span>';
+
     body.innerHTML =
       '<div class="detail-top">' +
         '<button class="btn ghost" id="btn-back">← 返回库</button>' +
@@ -52,7 +57,12 @@ const Detail = {
       '<div class="detail-hero">' + iconHtml +
         '<div class="hero-body">' +
           '<div class="hero-title"><h1>' + U.esc(app.name) + '</h1>' + liveHtml + '</div>' +
+          (app.autoName && app.autoName !== app.name
+            ? '<div class="hero-autoname" title="程序自己带的英文名">系统原名：' + U.esc(app.autoName) + '</div>'
+            : '') +
           '<div class="hero-path" title="' + U.esc(app.exePath) + '">' + U.esc(app.exePath) + '</div>' +
+          '<div class="hero-tags" id="d-tags" title="点一下设置标签">' + tagPills +
+            '<span class="tag-edit">设置标签</span></div>' +
           '<div class="hero-actions">' +
             (running
               ? '<button class="btn stop" id="btn-run">■ 结束</button>'
@@ -101,7 +111,7 @@ const Detail = {
     this.renderTable(d.sessions);
 
     document.getElementById('btn-back').onclick = () => App.setView('library');
-    document.getElementById('btn-reveal').onclick = () => window.api.apps.reveal(app.id);
+    document.getElementById('d-tags').onclick = () => Tags.assign(app.id);    document.getElementById('btn-reveal').onclick = () => window.api.apps.reveal(app.id);
     document.getElementById('btn-export').onclick = () => App.exportCsv();
     document.getElementById('btn-relocate').onclick = () => App.relocateApp(app.id);
     document.getElementById('btn-remove').onclick = () => App.removeApp(app.id);

@@ -7,6 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { readJson, writeJson, ensureDir } = require('./store');
+const { normalizeTagIds } = require('./tags');
 const { extractIcon, runPs } = require('./icon-extract');
 
 const JUNK_PATTERNS = [
@@ -66,6 +67,9 @@ class AppRegistry {
   load() {
     const data = readJson(this.file, { schemaVersion: 1, apps: [] });
     this.apps = Array.isArray(data.apps) ? data.apps : [];
+    // 老版本的清单里没有 tagIds 这一栏：读进来补成空数组，但先不写盘。
+    // 只有用户真的去改标签时才 save()，避免「打开一次程序就把文件重写一遍」。
+    for (const a of this.apps) a.tagIds = normalizeTagIds(a.tagIds);
     return this;
   }
 
@@ -192,6 +196,7 @@ class AppRegistry {
       imageName: info.imageName,
       altNames: info.altNames,
       processAlias: '',
+      tagIds: [],
       workDir: path.dirname(exePath),
       iconFile: icon.ok ? iconFile : null,
       iconSize: icon.ok ? icon.size : 0,
@@ -213,9 +218,29 @@ class AppRegistry {
   update(id, patch) {
     const app = this.get(id);
     if (!app) return { ok: false, reason: '找不到这个软件' };
+
+    // 自定义名称（卡片上那个中文名输入框）
+    // 用户填什么，app.name 就显示什么；系统自动读到的原名备份到 autoName，
+    // 这样卡片上还能显示英文原名做对照，清空输入框就能一键恢复。
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'customName')) {
+      const auto = app.autoName || app.name;
+      const custom = cleanText(patch.customName).slice(0, 40);
+      app.autoName = auto;
+      app.name = custom || auto;
+    }
+
     const allowed = ['name', 'note', 'watch', 'hidden', 'processAlias', 'args'];
     for (const k of allowed) {
       if (patch && Object.prototype.hasOwnProperty.call(patch, k)) app[k] = patch[k];
+    }
+
+    // 安全网：程序是靠 exe 文件名（imageName）认进程的。
+    // 万一老数据里缺这一栏，改名后可能认不出进程、记不到时长，这里从路径补回来。
+    if (!app.imageName && app.exePath) {
+      app.imageName = path.basename(app.exePath).replace(/\.exe$/i, '');
+    }
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'tagIds')) {
+      app.tagIds = normalizeTagIds(patch.tagIds);
     }
     this.save();
     return { ok: true, app };

@@ -252,8 +252,7 @@ function streak(rows) {
   return { current, longest, totalDays: days.length };
 }
 
-/** 单个软件的总览（四项时长全部走 effSecInRange，保证同一套口径，秒级也不会对不上） */
-function appSummary(rows, appId, now) {
+/** 单个软件的总览（四项时长全部走 effSecInRange，保证同一套口径，秒级也不会对不上） */function appSummary(rows, appId, now) {
   const list = rows.filter((s) => s.appId === appId);
   const total = overview(list, 0, Number.MAX_SAFE_INTEGER).sec;
   const today = overview(list, startOfDay(now), addDays(startOfDay(now), 1)).sec;
@@ -269,6 +268,69 @@ function appSummary(rows, appId, now) {
     avgSec: list.length ? Math.round(total / list.length) : 0,
     lastUsedMs: lastUsedMs || null,
   };
+}
+
+/**
+ * 按标签汇总。
+ *
+ * 注意这是「多标签」口径：一个软件挂了两个标签，它的时长会在两个标签下各算一次。
+ * 所以各标签之和可能大于真实总时长（overlapSec 就是多出来的那部分）。
+ * 界面上用一行小字把差额说清楚，不装作对得上。
+ *
+ * onlyIds：只统计这几个标签（传 null 表示全都算）。
+ * 统计页选中两个以上标签时用得上——那时候用户只想比这几类，
+ * 软件身上顺带挂的大类标签（比如两个游戏都挂的「游戏」）不该再冒出来占一片，
+ * 它的时长恰好等于所选几片之和，画进去纯属噪音。
+ */
+function tagBreakdown(rows, apps, fromMs, toMs, onlyIds) {
+  const perTag = new Map();
+  let totalSec = 0;
+  let untaggedSec = 0;
+  let untaggedSessions = 0;
+
+  for (const s of rows) {
+    const v = effSecInRange(s, fromMs, toMs);
+    if (v <= 0) continue;
+    totalSec += v;
+
+    const app = apps.get(s.appId);
+    const ids = app && Array.isArray(app.tagIds) ? app.tagIds : [];
+    if (!ids.length) {
+      untaggedSec += v;
+      untaggedSessions++;
+      continue;
+    }
+
+    for (const id of ids) {
+      if (onlyIds && !onlyIds.has(id)) continue;
+      let rec = perTag.get(id);
+      if (!rec) {
+        rec = { tagId: id, sec: 0, sessionCount: 0, appIds: new Set() };
+        perTag.set(id, rec);
+      }
+      rec.sec += v;
+      rec.sessionCount++;
+      rec.appIds.add(s.appId);
+    }
+  }
+
+  return {
+    totalSec: Math.round(totalSec),
+    untaggedSec: Math.round(untaggedSec),
+    untaggedSessions,
+    perTag,
+  };
+}
+
+/** 这条记录是否属于选中的标签；selected 为空表示不筛（选「未分类」用 __none__） */
+function matchesTags(app, selected) {
+  if (!selected || !selected.length) return true;
+  const ids = app && Array.isArray(app.tagIds) ? app.tagIds : [];
+  if (!ids.length) return selected.indexOf('__none__') >= 0;
+  for (const id of ids) {
+    if (selected.indexOf(id) >= 0) return true;
+  }
+  return false;
 }
 
 module.exports = {
@@ -291,4 +353,6 @@ module.exports = {
   ranking,
   streak,
   appSummary,
+  tagBreakdown,
+  matchesTags,
 };

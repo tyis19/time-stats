@@ -4,6 +4,9 @@
 const App = {
   state: {
     apps: [],
+    tags: [],
+    untagged: { appCount: 0 },
+    tagFilter: new Set(),
     running: new Map(),
     settings: {},
     query: '',
@@ -29,6 +32,7 @@ const App = {
     this.bind();
     Library.bind();
 
+    await this.refreshTags();
     await this.refreshApps();
 
     const snap = await window.api.tracker.snapshot();
@@ -37,6 +41,7 @@ const App = {
     window.api.onUpdate((s) => this.onRunning(s));
     window.api.onEvent((e) => this.onEvent(e));
     window.api.onAppsChanged(() => this.refreshApps());
+    window.api.onTagsChanged(() => this.onTagsChanged());
 
     setInterval(() => {
       Library.updateLive();
@@ -80,6 +85,26 @@ const App = {
 
   async refreshApps() {
     this.state.apps = await window.api.apps.list();
+    if (this.state.view === 'library') Library.render();
+    if (this.state.view === 'stats') Stats.render();
+  },
+
+  async refreshTags() {
+    const res = await window.api.tags.list();
+    this.state.tags = (res && res.tags) || [];
+    this.state.untagged = (res && res.untagged) || { appCount: 0 };
+
+    // 正在筛选的标签被删掉了：把它从筛选里摘掉，否则整页会筛成空的
+    const valid = new Set(this.state.tags.map((t) => t.id));
+    valid.add(Tags.NONE);
+    for (const id of Array.from(this.state.tagFilter)) {
+      if (!valid.has(id)) this.state.tagFilter.delete(id);
+    }
+  },
+
+  /** 标签变了：筛选条、卡片上的小标签、统计页都要跟着重画 */
+  async onTagsChanged() {
+    await this.refreshTags();
     if (this.state.view === 'library') Library.render();
     if (this.state.view === 'stats') Stats.render();
   },
@@ -222,6 +247,7 @@ const App = {
 
     const items = [
       { label: '查看详情', fn: () => Detail.open(id) },
+      { label: '设置标签…', fn: () => Tags.assign(id) },
       isRunning ? { label: '结束计时', fn: () => this.stopApp(id, false) } : { label: '开始', fn: () => this.startApp(id) },
       { label: '打开所在文件夹', fn: () => window.api.apps.reveal(id) },
       { label: '重新定位…', fn: () => this.relocateApp(id) },

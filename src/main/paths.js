@@ -64,6 +64,7 @@ function initPaths() {
     dataDir,
     runtimeDir,
     appsFile: path.join(dataDir, 'apps.json'),
+    tagsFile: path.join(dataDir, 'tags.json'),
     sessionsFile: path.join(dataDir, 'sessions.ndjson'),
     settingsFile: path.join(dataDir, 'settings.json'),
     activeFile: path.join(dataDir, 'active-session.json'),

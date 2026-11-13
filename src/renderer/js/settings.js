@@ -31,6 +31,14 @@ const Settings = {
           '</div>' +
 
           '<div class="panel">' +
+            '<div class="panel-head"><h3>标签</h3><span class="panel-sub">分类统计用</span></div>' +
+            '<div class="setting-row">' +
+              '<div><div class="t">管理标签</div><div class="d">新建、改名、换颜色、删除，也可以在一个标签里批量勾软件。<br />库页顶部也有一条标签筛选，平时用那个更快。</div></div>' +
+              '<button class="btn ghost sm" id="btn-tags">管理</button>' +
+            '</div>' +
+          '</div>' +
+
+          '<div class="panel">' +
             '<div class="panel-head"><h3>数据</h3></div>' +
             '<div class="setting-row">' +
               '<div><div class="t">数据保存在这里</div><div class="d" style="user-select:text">' + U.esc(info.dataDir) + '<br />整个文件夹拷走，换电脑后记录也跟着走。</div></div>' +
@@ -136,6 +144,7 @@ const Settings = {
     };
 
     document.getElementById('btn-open-data').onclick = () => window.api.system.openDataFolder();
+    document.getElementById('btn-tags').onclick = () => Tags.manager();
     document.getElementById('btn-startup-folder').onclick = () => window.api.system.openStartupFolder();
     document.getElementById('btn-export').onclick = () => App.exportCsv();
 
